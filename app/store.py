@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -61,6 +61,40 @@ class AnalysisInput:
             "hi": np.asarray(self.gain_upper, dtype=float),
         }
 
+    def segment_arrays(self, segment: int) -> tuple[np.ndarray, np.ndarray]:
+        """Current (committed) energy/error vectors for one segment."""
+        if segment == 0:
+            return (
+                np.asarray(self.band_energy_1, dtype=float),
+                np.asarray(self.band_error_1, dtype=float),
+            )
+        return (
+            np.asarray(self.band_energy_2, dtype=float),
+            np.asarray(self.band_error_2, dtype=float),
+        )
+
+    def with_segment_readings(
+        self,
+        segment: int,
+        energy: list[float],
+        error: list[float],
+    ) -> "AnalysisInput":
+        """Return a copy where one segment carries replacement readings."""
+        if segment == 0:
+            return replace(
+                self, band_energy_1=list(energy), band_error_1=list(error)
+            )
+        return replace(
+            self, band_energy_2=list(energy), band_error_2=list(error)
+        )
+
+    def readings_view(self) -> dict[str, dict[str, list[float]]]:
+        """Serializable per-segment readings held by this payload."""
+        return {
+            "0": {"energy": list(self.band_energy_1), "error": list(self.band_error_1)},
+            "1": {"energy": list(self.band_energy_2), "error": list(self.band_error_2)},
+        }
+
 
 @dataclass(frozen=True)
 class TakeView:
@@ -76,6 +110,9 @@ class ReportVersion:
     possibilities: list[tuple[str, list[TakeView]]]
     evidence: dict[str, Any]
     contributions: dict[int, dict[int, bool]]  # segment -> key index -> pressed
+    # Per-segment band readings (energy + absolute error) this version was
+    # computed from; every version keeps its own snapshot for later retrieval.
+    readings: dict[str, dict[str, list[float]]]
     created_at: str
 
 
@@ -170,6 +207,7 @@ class Store:
             possibilities=possibilities,
             evidence=verdict.evidence,
             contributions={seg: dict(keys) for seg, keys in contributions.items()},
+            readings=payload.readings_view(),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -341,6 +379,180 @@ class Store:
             analysis.reports.append(report)
             return analysis
 
+    # -- segment reading replacement --------------------------------------
+    def replace_readings(
+        self,
+        analysis_id: str,
+        expected_version: int,
+        segment: int,
+        energy: list[float],
+        error: list[float],
+    ) -> Analysis:
+        """Atomically replace one segment's band readings and recompute.
+
+        The submitted readings are accepted only when a reconstruction still
+        exists for both segments: then the new readings and the new report
+        version take effect together, while all editor confirmations carry
+        over unchanged.  Otherwise nothing is applied and the response carries
+        a minimum-cardinality retest list with a witness for the segment.
+
+        As with confirmations, the solver runs outside the store lock; reads
+        and confirmation submissions stay available during recomputation and
+        a version change before commit rejects the request (the editor must
+        resubmit against the new version).
+        """
+        with self._lock:
+            analysis = self.get(analysis_id)
+            current = analysis.current
+            payload = analysis.payload
+            if segment not in (0, 1):
+                raise ApiError("invalid_input", f"segment {segment} must be 0 or 1")
+            m = len(payload.band_names)
+            if len(energy) != m or len(error) != m:
+                raise ApiError(
+                    "invalid_input",
+                    f"segment readings must each have {m} entries (one per band)",
+                )
+            if expected_version != current.version:
+                raise ApiError(
+                    "stale_version",
+                    f"report has advanced to version {current.version}; request targeted "
+                    f"version {expected_version}",
+                    status=409,
+                    detail={"current_version": current.version, "expected_version": expected_version},
+                )
+            # Only reports that currently admit a feasible reconstruction may
+            # be re-read; an already-impossible analysis must stay untouched.
+            if current.kind == "impossible":
+                raise ApiError(
+                    "no_feasible_reconstruction",
+                    "the current report has no feasible reconstruction; new readings "
+                    "are only accepted against a report that can currently be reconstructed",
+                    status=409,
+                    detail={"current_version": current.version},
+                )
+
+            observed_version = current.version
+            committed_payload = payload
+            confirmations_snapshot = {
+                seg: dict(keys) for seg, keys in analysis.confirmations.items()
+            }
+
+        b_new = np.asarray(energy, dtype=float)
+        e_new = np.asarray(error, dtype=float)
+        b_old, e_old = committed_payload.segment_arrays(segment)
+        arrays = committed_payload.arrays()
+        n, m_count = arrays["templates"].shape
+        try:
+            solver._validate_energy("band_energy", b_new, m_count)
+            solver._validate_error("band_error", e_new, m_count)
+        except solver.SolverError as exc:
+            raise ApiError("invalid_input", str(exc)) from exc
+
+        candidate = committed_payload.with_segment_readings(segment, energy, error)
+        candidate_arrays = candidate.arrays()
+        flat: solver.Confirmations = {
+            (seg, key): pressed
+            for seg, keys in confirmations_snapshot.items()
+            for key, pressed in keys.items()
+        }
+        try:
+            verdict = solver.classify(
+                candidate_arrays["templates"],
+                (candidate_arrays["b1"], candidate_arrays["b2"]),
+                (candidate_arrays["e1"], candidate_arrays["e2"]),
+                candidate_arrays["lo"],
+                candidate_arrays["hi"],
+                confirmations=flat,
+                time_limit=candidate.time_limit,
+            )
+        except solver.SolverError as exc:
+            raise ApiError("invalid_input", str(exc)) from exc
+        except solver.SolverInconclusive as exc:
+            # The computation did not finish: keep the current readings and
+            # report exactly as they were.
+            raise ApiError("solver_inconclusive", str(exc), status=503) from exc
+
+        if verdict.kind != "impossible":
+            report = self._version_from_verdict(
+                candidate, verdict, confirmations_snapshot, observed_version + 1
+            )
+            with self._lock:
+                if analysis.current.version != observed_version:
+                    raise ApiError(
+                        "stale_version",
+                        f"report advanced to version {analysis.current.version} during "
+                        "recomputation; resubmit the readings against the new version",
+                        status=409,
+                        detail={
+                            "current_version": analysis.current.version,
+                            "expected_version": expected_version,
+                        },
+                    )
+                analysis.payload = candidate
+                analysis.reports.append(report)
+                return analysis
+
+        # Conflicting readings: compute the fewest bands to retest.  No band
+        # subset is enumerated; one MILP minimises the retest count.
+        try:
+            plan = solver.minimum_retest_plan(
+                arrays["templates"],
+                b_old,
+                e_old,
+                b_new,
+                e_new,
+                arrays["lo"],
+                arrays["hi"],
+                segment=segment,
+                confirmations=flat,
+                time_limit=committed_payload.time_limit,
+            )
+        except solver.SolverError as exc:
+            raise ApiError("invalid_input", str(exc)) from exc
+        except solver.SolverInconclusive as exc:
+            raise ApiError("solver_inconclusive", str(exc), status=503) from exc
+
+        hybrid = committed_payload.with_segment_readings(
+            segment,
+            [float(v) for v in plan.effective_energy],
+            [float(v) for v in plan.effective_error],
+        )
+        detail = {
+            "current_version": observed_version,
+            "expected_version": expected_version,
+            "segment": segment,
+            "minimum_retest_count": len(plan.retest_bands),
+            "retest_bands": [committed_payload.band_names[j] for j in plan.retest_bands],
+            "retest_band_indexes": plan.retest_bands,
+            "witness": {
+                "segment": segment,
+                "pressed_keys": [
+                    committed_payload.key_names[k] for k in plan.solution.pressed
+                ],
+                "gains": {
+                    committed_payload.key_names[k]: float(plan.solution.gains[k])
+                    for k in plan.solution.pressed
+                },
+            },
+            # Readings the witness actually uses: listed bands reverted to the
+            # current values, every other band keeping the submitted new ones.
+            "hybrid_readings": hybrid.readings_view(),
+            "submitted_readings": {
+                "segment": segment,
+                "energy": [float(v) for v in b_new],
+                "error": [float(v) for v in e_new],
+            },
+        }
+        raise ApiError(
+            "retest_required",
+            "the new readings conflict with a feasible reconstruction; retest the "
+            "listed bands (their current values are restored for those bands only, "
+            "submitted values are kept for every other band) and resubmit",
+            status=409,
+            detail=detail,
+        )
+
 
 # ---------------------------------------------------------------------------
 # serialization
@@ -362,6 +574,7 @@ def serialize_version(analysis: Analysis, report: ReportVersion) -> dict[str, An
         "created_at": report.created_at,
         "key_names": payload.key_names,
         "band_names": payload.band_names,
+        "readings": report.readings,
         "possibilities": [
             {
                 "hypothesis": name,

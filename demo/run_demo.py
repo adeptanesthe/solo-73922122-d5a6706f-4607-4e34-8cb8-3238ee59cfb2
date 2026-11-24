@@ -75,6 +75,49 @@ def main() -> None:
     status, original = call("GET", f"/analyses/{analysis_id}?version={version}")
     print(f"=== original version {version} still queryable -> HTTP {status}, kind={original.get('kind')}")
 
+    # Re-extracted readings beat on a fresh "same key set" analysis.
+    status, base = call("POST", "/analyses", load("01_same.json"))
+    readings_id = base["analysis_id"]
+    print(f"\n=== readings analysis created -> HTTP {status}, id={readings_id}, version=1")
+
+    # 1) Replacement that still admits a reconstruction: new readings and the
+    #    recomputed report take effect together as version 2.
+    status, replaced = call(
+        "POST", f"/analyses/{readings_id}/readings", load("05_readings_replacement.json")
+    )
+    show("readings replacement accepted", status, replaced)
+    if status == 200:
+        print("  version-2 readings:", replaced.get("readings"))
+
+    # 2) Conflicting re-extraction: minimum retest list plus a witness.
+    status, conflict = call(
+        "POST", f"/analyses/{readings_id}/readings", load("06_readings_conflict.json")
+    )
+    print("\n=== conflicting readings -> HTTP", status, conflict.get("error", {}).get("code"))
+    if status == 409:
+        detail = conflict["error"]["detail"]
+        print("  retest bands:", detail["retest_bands"],
+              "(count =", detail["minimum_retest_count"], ")")
+        print("  witness:", detail["witness"])
+        # Resubmit the hybrid readings: listed bands revert to current values,
+        # every other band keeps the submitted new values.
+        hybrid = {
+            "expected_version": 2,
+            "segment": detail["segment"],
+            "band_energy": detail["hybrid_readings"][str(detail["segment"])]["energy"],
+            "band_error": detail["hybrid_readings"][str(detail["segment"])]["error"],
+        }
+        status, healed = call(
+            "POST", f"/analyses/{readings_id}/readings", hybrid
+        )
+        show("hybrid resubmission accepted", status, healed)
+
+    # Readings used by each version remain retrievable by version.
+    for v in (1, 2, 3):
+        status, row = call("GET", f"/analyses/{readings_id}?version={v}")
+        if status == 200:
+            print(f"=== version {v} stored readings: {row['readings']['0']}")
+
 
 if __name__ == "__main__":
     main()

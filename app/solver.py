@@ -80,6 +80,21 @@ class Verdict:
     evidence: dict[str, object]
 
 
+@dataclass(frozen=True)
+class RetestPlan:
+    """Minimum-cardinality set of bands to re-measure for one conflicting segment."""
+
+    segment: int
+    # Band indexes whose submitted readings must be reverted to the current ones.
+    retest_bands: list[int]
+    # Verified reconstruction of the segment under the hybrid readings.
+    solution: Solution
+    # Effective readings actually used by the witness: new values outside the
+    # retest list, current values for bands inside it.
+    effective_energy: np.ndarray
+    effective_error: np.ndarray
+
+
 # ---------------------------------------------------------------------------
 # validation
 # ---------------------------------------------------------------------------
@@ -154,14 +169,15 @@ def _add_gain_block(
     """Link one take's binaries to gains and add its band constraints."""
     for k in range(n):
         ub[g_off + k] = hi[k]
-        # g - hi*x <= 0
+        # g - hi*x <= 0: an unplayed key (x = 0) has gain at most zero.
         row = np.zeros(nv)
         row[g_off + k] = 1.0
         row[x_off + k] = -hi[k]
         rows.append(row)
         rlb.append(-_INF)
         rub.append(0.0)
-        # lo*x - g <= 0
+        # lo*x - g <= 0: a played key (x = 1) needs g >= lo; with g >= 0 (the
+        # variable lower bound) and the constraint above, x = 0 pins g = 0.
         row = np.zeros(nv)
         row[x_off + k] = lo[k]
         row[g_off + k] = -1.0
@@ -510,3 +526,168 @@ def classify(
     if kind == "impossible":
         evidence["reason"] = "conflicting_evidence"
     return Verdict(kind=kind, possibilities=possibilities, evidence=evidence)
+
+
+# ---------------------------------------------------------------------------
+# minimum-cardinality retest plan for a conflicting segment
+# ---------------------------------------------------------------------------
+def minimum_retest_plan(
+    templates: np.ndarray,
+    current_energy: np.ndarray,
+    current_error: np.ndarray,
+    new_energy: np.ndarray,
+    new_error: np.ndarray,
+    gain_lower: np.ndarray,
+    gain_upper: np.ndarray,
+    segment: int,
+    confirmations: Confirmations | None = None,
+    time_limit: float = 10.0,
+) -> RetestPlan:
+    """Find the fewest bands whose new readings must be reverted for one segment.
+
+    A segment is reconstructable when keys exist whose scaled templates land in
+    every measured band interval.  With *new* readings the segment is
+    infeasible, while the *current* readings are known to admit a solution.
+    For every band ``j`` a binary ``z[j]`` selects which interval applies:
+
+    * ``z[j] = 0`` -> the submitted (new) interval stays in force;
+    * ``z[j] = 1`` -> the current interval is restored (the band is retested).
+
+    The resulting interval endpoints are piecewise-linear in ``z`` and are
+    linearised with big-M constants, so minimising ``sum(z)`` is one MILP and
+    no band combination is ever enumerated.  A key pressed by an editor
+    confirmation is pinned on; a key confirmed as not pressed is pinned off.
+
+    Raises :class:`SolverError` for malformed input and
+    :class:`SolverInconclusive` if HiGHS cannot finish within the time limit.
+    """
+    templates = np.asarray(templates, dtype=float)
+    b_old = np.asarray(current_energy, dtype=float)
+    e_old = np.asarray(current_error, dtype=float)
+    b_new = np.asarray(new_energy, dtype=float)
+    e_new = np.asarray(new_error, dtype=float)
+    lo = np.asarray(gain_lower, dtype=float)
+    hi = np.asarray(gain_upper, dtype=float)
+
+    _validate_templates(templates)
+    n, m = templates.shape
+    _validate_energy("new_band_energy", b_new, m)
+    _validate_error("new_band_error", e_new, m)
+    _validate_energy("current_band_energy", b_old, m)
+    _validate_error("current_band_error", e_old, m)
+    _validate_gains(lo, hi, n)
+    pins: dict[int, bool] = {}
+    for (seg, key), pressed in dict(confirmations or {}).items():
+        if seg not in (0, 1):
+            raise SolverError(f"confirmation segment {seg} must be 0 or 1")
+        if not 0 <= key < n:
+            raise SolverError(f"confirmation key index {key} out of range")
+        if seg == segment:
+            pins[key] = pressed
+
+    # Layout: x (pressed binaries) | g (gains) | z (retest binaries).
+    nv = 2 * n + m
+    x_off, g_off, z_off = 0, n, 2 * n
+    c = np.zeros(nv)
+    c[z_off : z_off + m] = 1.0  # minimum number of reverted bands
+    integrality = np.zeros(nv)
+    integrality[x_off : x_off + n] = 1
+    integrality[z_off : z_off + m] = 1
+    lb = np.zeros(nv)
+    ub = np.zeros(nv)
+    ub[x_off : x_off + n] = 1.0
+    ub[z_off : z_off + m] = 1.0
+    ub[g_off : g_off + n] = hi
+    rows: list[np.ndarray] = []
+    rlb: list[float] = []
+    rub: list[float] = []
+
+    # Gain/pressed linkage, as in the classification models.
+    for k in range(n):
+        row = np.zeros(nv)
+        row[g_off + k] = 1.0
+        row[x_off + k] = -hi[k]
+        rows.append(row)
+        rlb.append(-_INF)
+        rub.append(0.0)
+        row = np.zeros(nv)
+        row[x_off + k] = lo[k]
+        row[g_off + k] = -1.0
+        rows.append(row)
+        rlb.append(-_INF)
+        rub.append(0.0)
+
+    for j in range(m):
+        # Hybrid closed interval [L(z), U(z)]:
+        #   z = 0 -> new readings; z = 1 -> current readings.
+        # L(z) = l0 + (l1 - l0) z,  U(z) = u0 + (u1 - u0) z.
+        # Endpoints must NOT be clamped to zero: clamping an upper endpoint
+        # below a negative lower endpoint would fabricate an empty interval
+        # (feasible produced energies remain non-negative because templates and
+        # gains are non-negative; the interval itself may touch below zero).
+        l0 = float(b_new[j] - e_new[j])
+        l1 = float(b_old[j] - e_old[j])
+        u0 = float(b_new[j] + e_new[j])
+        u1 = float(b_old[j] + e_old[j])
+        # p >= l0 + (l1 - l0) z
+        #   <=>  -p + (l1 - l0) z <= -l0
+        row = np.zeros(nv)
+        row[g_off : g_off + n] = -templates[:, j]
+        row[z_off + j] = l1 - l0
+        rows.append(row)
+        rlb.append(-_INF)
+        rub.append(-l0)
+        # p <= u0 + (u1 - u0) z
+        #   <=>  p - (u1 - u0) z <= u0
+        row = np.zeros(nv)
+        row[g_off : g_off + n] = templates[:, j]
+        row[z_off + j] = -(u1 - u0)
+        rows.append(row)
+        rlb.append(-_INF)
+        rub.append(u0)
+
+    for key, pressed in pins.items():
+        lb[x_off + key] = ub[x_off + key] = 1.0 if pressed else 0.0
+
+    result = _run_milp(c, integrality, lb, ub, rows, rlb, rub, time_limit)
+    status = int(getattr(result, "status", -1))
+    if status != _OPTIMAL:
+        if status == _INFEASIBLE:
+            # Reverting any band to the (known-feasible) current readings always
+            # admits a solution, so this indicates malformed data rather than a
+            # genuine conflict.
+            raise SolverError("retest model unexpectedly infeasible")
+        raise SolverInconclusive(
+            f"retest model inconclusive: {getattr(result, 'message', status)}"
+        )
+
+    x = np.asarray(result.x)
+    z_bits = np.rint(x[z_off : z_off + m]).astype(int)
+    retest = [int(j) for j in range(m) if z_bits[j] == 1]
+
+    effective_energy = np.where(z_bits == 1, b_old, b_new)
+    effective_error = np.where(z_bits == 1, e_old, e_new)
+    solution = _witness(
+        templates,
+        n,
+        x[x_off : x_off + n],
+        x[g_off : g_off + n],
+        effective_energy,
+        effective_error,
+        lo,
+        hi,
+    )
+    if solution is None:
+        raise SolverInconclusive("retest witness failed verification")
+    # Every pinned key must be honoured by the returned witness.
+    for key, pressed in pins.items():
+        if (key in solution.pressed) != pressed:
+            raise SolverInconclusive("retest witness violates an editor confirmation")
+
+    return RetestPlan(
+        segment=segment,
+        retest_bands=retest,
+        solution=solution,
+        effective_energy=effective_energy,
+        effective_error=effective_error,
+    )

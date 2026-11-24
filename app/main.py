@@ -12,11 +12,12 @@ from . import store as store_mod
 
 app = FastAPI(
     title="Piano take key-set classifier",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Decide whether two recorded attempts use the same set of piano keys, "
-        "report a witness for each feasible case, and let an editor confirm or "
-        "correct individual key presses against a versioned report."
+        "report a witness for each feasible case, let an editor confirm or "
+        "correct individual key presses against a versioned report, and replace "
+        "one segment's spectral readings with a re-extracted measurement."
     ),
 )
 
@@ -55,6 +56,22 @@ class ConfirmationRequest(BaseModel):
 
     expected_version: int = Field(..., ge=1, description="Report version the editor is looking at.")
     confirmations: list[ConfirmationItem] = Field(..., min_length=1)
+
+
+class ReadingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(
+        ..., ge=1,
+        description="Current report version; the request is rejected if it has advanced.",
+    )
+    segment: Literal[0, 1] = Field(..., description="Which take's readings are replaced.")
+    band_energy: list[float] = Field(
+        ..., description="Re-extracted band energies for this segment."
+    )
+    band_error: list[float] = Field(
+        ..., description="Re-extracted absolute band errors for this segment."
+    )
 
 
 @app.exception_handler(store_mod.ApiError)
@@ -135,4 +152,24 @@ def post_confirmations(analysis_id: str, req: ConfirmationRequest) -> dict:
             )
         target[key_index] = item.pressed
     updated = STORE.confirm(analysis_id, req.expected_version, incoming)
+    return store_mod.serialize_version(updated, updated.current)
+
+
+@app.post("/analyses/{analysis_id}/readings")
+def post_readings(analysis_id: str, req: ReadingRequest) -> dict:
+    analysis = STORE.get(analysis_id)
+    m = len(analysis.payload.band_names)
+    if len(req.band_energy) != m or len(req.band_error) != m:
+        raise store_mod.ApiError(
+            "invalid_input",
+            f"band_energy and band_error must each have {m} entries (one per band)",
+            detail={"band_names": analysis.payload.band_names},
+        )
+    updated = STORE.replace_readings(
+        analysis_id,
+        req.expected_version,
+        int(req.segment),
+        list(req.band_energy),
+        list(req.band_error),
+    )
     return store_mod.serialize_version(updated, updated.current)

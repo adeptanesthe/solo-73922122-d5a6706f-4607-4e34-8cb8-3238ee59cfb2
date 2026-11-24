@@ -181,3 +181,115 @@ def test_confirmation_conflict_evidence() -> None:
     )
     assert verdict.kind == "different"
     assert verdict.evidence["models"]["same"]["reason"] == "confirmations_imply_different_press_state"
+
+
+# ---------------------------------------------------------------------------
+# minimum-cardinality retest plan
+# ---------------------------------------------------------------------------
+def _bruteforce_min_retest(templates, b_old, e_old, b_new, e_new, lo, hi):
+    """Exhaustive reference: minimum number of bands to revert to current."""
+    n, m = templates.shape
+    best = None
+    for size in range(m + 1):
+        for combo in itertools.combinations(range(m), size):
+            reverted = set(combo)
+            energy = np.array([b_old[j] if j in reverted else b_new[j] for j in range(m)])
+            error = np.array([e_old[j] if j in reverted else e_new[j] for j in range(m)])
+            feasible = False
+            for pressed_size in range(n + 1):
+                for keys in itertools.combinations(range(n), pressed_size):
+                    if solver._feasible_gains(templates, list(keys), energy, error, lo, hi) is not None:
+                        feasible = True
+                        break
+                if feasible:
+                    break
+            if feasible:
+                return size, reverted
+    return best, set()
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_minimum_retest_plan_matches_bruteforce(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    n, m = 3, 3
+    templates = rng.integers(0, 3, size=(n, m)).astype(float)
+    lo = rng.uniform(0.1, 0.4, size=n)
+    hi = rng.uniform(0.8, 2.5, size=n)
+
+    # Current (known feasible) readings come from a real pressed set.
+    true_pressed = list(rng.choice(n, size=rng.integers(1, n + 1), replace=False))
+    gains = np.zeros(n)
+    for k in true_pressed:
+        gains[k] = rng.uniform(lo[k], hi[k])
+    b_old = gains @ templates
+    e_old = rng.uniform(0.01, 0.1, size=m)
+
+    # Wild new re-extracted readings: usually conflicting, occasionally not.
+    b_new = rng.uniform(0.0, 4.0, size=m)
+    e_new = rng.uniform(0.0, 0.2, size=m)
+
+    plan = solver.minimum_retest_plan(
+        templates, b_old, e_old, b_new, e_new, lo, hi, segment=0
+    )
+    expected_size, _ = _bruteforce_min_retest(
+        templates, b_old, e_old, b_new, e_new, lo, hi
+    )
+    assert len(plan.retest_bands) == expected_size
+    # The returned set must itself be feasible under the hybrid readings.
+    g = np.zeros(n)
+    for k in plan.solution.pressed:
+        g[k] = plan.solution.gains[k]
+    produced = g @ templates
+    assert np.all(produced >= plan.effective_energy - plan.effective_error - 1e-6)
+    assert np.all(produced <= plan.effective_energy + plan.effective_error + 1e-6)
+    # Hybrid readings really do revert exactly the listed bands.
+    for j in range(m):
+        if j in plan.retest_bands:
+            assert plan.effective_energy[j] == b_old[j]
+            assert plan.effective_error[j] == e_old[j]
+        else:
+            assert plan.effective_energy[j] == b_new[j]
+            assert plan.effective_error[j] == e_new[j]
+
+
+def test_retest_plan_known_single_band() -> None:
+    templates = np.eye(3)
+    lo = np.full(3, 0.5)
+    hi = np.full(3, 2.0)
+    b_old = np.array([1.0, 0.0, 0.0])
+    e_old = np.full(3, 0.05)
+    b_new = np.array([1.0, 0.0, 5.0])  # band 2 unreachable with max gain 2
+    e_new = np.full(3, 0.05)
+    plan = solver.minimum_retest_plan(
+        templates, b_old, e_old, b_new, e_new, lo, hi, segment=0
+    )
+    assert plan.retest_bands == [2]
+    assert plan.solution.pressed == [0]
+    assert plan.solution.gains[0] == pytest.approx(1.0, abs=0.06)
+
+
+def test_retest_plan_zero_bands_when_new_readings_fit() -> None:
+    templates = np.eye(2)
+    lo = np.full(2, 0.5)
+    hi = np.full(2, 2.0)
+    b = np.array([1.0, 0.0])
+    e = np.full(2, 0.05)
+    plan = solver.minimum_retest_plan(templates, b, e, b, e, lo, hi, segment=1)
+    assert plan.retest_bands == []
+
+
+def test_retest_witness_honors_pinned_key() -> None:
+    # Two keys with identical templates: energy 1 can be either key.
+    templates = np.array([[1.0], [1.0]])
+    lo = np.array([0.5, 0.5])
+    hi = np.array([1.0, 1.0])
+    b_old = np.array([1.0])
+    e_old = np.array([0.0])
+    b_new = np.array([5.0])  # infeasible -> band 0 must be reverted
+    e_new = np.array([0.0])
+    plan = solver.minimum_retest_plan(
+        templates, b_old, e_old, b_new, e_new, lo, hi,
+        segment=0, confirmations={(0, 1): True},
+    )
+    assert plan.retest_bands == [0]
+    assert 1 in plan.solution.pressed  # pinned key present in the witness
